@@ -1,30 +1,47 @@
 package org.firstinspires.ftc.teamcode.subsystems.shooter
 
+import com.bylazar.configurables.annotations.Configurable
+import com.bylazar.telemetry.PanelsTelemetry
+import dev.nextftc.control.ControlSystem
+import dev.nextftc.control.KineticState
+import dev.nextftc.control.builder.controlSystem
+import dev.nextftc.control.feedback.PIDCoefficients
+import dev.nextftc.control.feedforward.BasicFeedforwardParameters
 import dev.nextftc.core.subsystems.Subsystem
 import dev.nextftc.hardware.impl.MotorEx
+import kotlin.math.*
 
 /**
- * Flywheel subsystem with automatic speed adjustment based on distance.
- * Uses distance from Kalman filter + odometry fusion.
+ * Flywheel with NextFTC PID + Feedforward control.
+ * Automatic speed adjustment based on distance.
  */
+@Configurable
 object FlyWheel : Subsystem {
     
     private val motor1 = MotorEx("Fly1")
     private val motor2 = MotorEx("Fly2").reversed()
     
-    // Velocity presets based on distance (TUNE THESE for your robot!)
-    // Format: distance in inches -> RPM
-    private val distanceToRPM = mapOf(
-        0.0 to 0.0,      // Stop
-        12.0 to 800.0,   // Very close
-        18.0 to 1000.0,  // Close
-        24.0 to 1150.0,  // Medium-close
-        30.0 to 1250.0,  // Medium
-        36.0 to 1350.0,  // Medium-far
-        42.0 to 1450.0,  // Far
-        48.0 to 1550.0,  // Very far
-        60.0 to 1650.0,  // Max range
-        999.0 to 1700.0  // Beyond max
+    // PID + FF Coefficients (TUNE THESE!)
+    @JvmField var ffCoefficients = BasicFeedforwardParameters(0.003, 0.08, 0.0) // kV, kA, kS
+    @JvmField var pidCoefficients = PIDCoefficients(0.009, 0.0, 0.01) // kP, kI, kD
+    
+    // NextFTC Control System
+    private val controller: ControlSystem = controlSystem {
+        basicFF(ffCoefficients)
+        velPid(pidCoefficients)
+    }
+    
+    // Distance to RPM mapping (TUNE THESE!)
+    private val distanceToRPM = listOf(
+        0.0 to 0.0,
+        12.0 to 800.0,
+        18.0 to 1000.0,
+        24.0 to 1150.0,
+        30.0 to 1250.0,
+        36.0 to 1350.0,
+        42.0 to 1450.0,
+        48.0 to 1550.0,
+        60.0 to 1650.0
     )
     
     // Current state
@@ -33,43 +50,40 @@ object FlyWheel : Subsystem {
     var isRunning = false
     
     /**
-     * Set flywheel speed based on distance (automatic)
-     * Uses odometry + Kalman filter distance
+     * Set flywheel speed automatically based on distance
      */
     fun setSpeedForDistance(distance: Double) {
         currentDistance = distance
         
-        // Find the appropriate RPM for this distance
         var rpm = 0.0
-        for ((dist, r) in distanceToRPM.entries.sortedBy { it.key }) {
+        for ((dist, r) in distanceToRPM) {
             if (distance <= dist) {
                 rpm = r
                 break
             }
         }
         
-        targetRPM = rpm
-        isRunning = rpm > 100
+        setRPM(rpm)
     }
     
     /**
-     * Manual RPM setting (override automatic)
+     * Set target RPM (uses NextFTC ControlSystem)
      */
     fun setRPM(rpm: Double) {
         targetRPM = rpm
-        isRunning = rpm > 100
+        // KineticState(position, velocity) - position=0 for velocity-only control
+        controller.goal = KineticState(0.0, rpm)
+        isRunning = rpm > 50
     }
     
     /**
-     * Get current average velocity
+     * Manual power override
      */
-    val velocity: Double get() = (motor1.velocity + motor2.velocity) / 2.0
-    
-    /**
-     * Check if at target speed (within tolerance)
-     */
-    fun isAtSpeed(tolerance: Double = 100.0): Boolean {
-        return kotlin.math.abs(velocity - targetRPM) < tolerance
+    fun setPower(power: Double) {
+        isRunning = false
+        controller.goal = KineticState(0.0, 0.0)
+        motor1.power = power.coerceIn(-1.0, 1.0)
+        motor2.power = power.coerceIn(-1.0, 1.0)
     }
     
     /**
@@ -77,16 +91,27 @@ object FlyWheel : Subsystem {
      */
     fun stop() {
         targetRPM = 0.0
-        motor1.power = 0.0
-        motor2.power = 0.0
+        controller.goal = KineticState(0.0, 0.0)
         isRunning = false
     }
     
     /**
-     * Get motor synchronization status
+     * Get current velocity
+     */
+    val velocity: Double get() = motor1.velocity
+    
+    /**
+     * Check if at target speed
+     */
+    fun isAtSpeed(tolerance: Double = 100.0): Boolean {
+        return abs(velocity - targetRPM) < tolerance
+    }
+    
+    /**
+     * Check motor sync
      */
     fun isSynced(tolerance: Double = 150.0): Boolean {
-        return kotlin.math.abs(motor1.velocity - motor2.velocity) < tolerance
+        return abs(motor1.velocity - motor2.velocity) < tolerance
     }
     
     override fun periodic() {
@@ -96,15 +121,21 @@ object FlyWheel : Subsystem {
             return
         }
         
-        // Simple velocity control (TUNE for your robot!)
-        // In production, use PID + Feedforward
-        val error = targetRPM - velocity
-        val kP = 0.003  // Proportional gain
+        // NextFTC PID + FF control
+        // Uses motor1 as feedback source
+        val controlEffort = controller.calculate(motor1.state)
         
-        var power = error * kP
-        power = power.coerceIn(-0.85, 0.85)
+        // Apply to both motors (clamped for safety)
+        val clampedPower = controlEffort.coerceIn(-0.85, 0.85)
+        motor1.power = clampedPower
+        motor2.power = clampedPower
         
-        motor1.power = power
-        motor2.power = power
+        // Telemetry
+        PanelsTelemetry.telemetry.addData("Flywheel Power", "%.3f".format(clampedPower))
+        PanelsTelemetry.telemetry.addData("Flywheel Target RPM", "%.0f".format(targetRPM))
+        PanelsTelemetry.telemetry.addData("Flywheel Actual RPM", "%.0f".format(velocity))
+        PanelsTelemetry.telemetry.addData("Flywheel Motor 2 RPM", "%.0f".format(motor2.velocity))
+        PanelsTelemetry.telemetry.addData("Flywheel Synced", if (isSynced()) "YES" else "NO")
+        PanelsTelemetry.telemetry.addData("Flywheel At Speed", if (isAtSpeed()) "YES" else "NO")
     }
 }
